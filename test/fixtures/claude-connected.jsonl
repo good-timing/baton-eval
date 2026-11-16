@@ -1,0 +1,2 @@
+{"type": "system", "subtype": "init", "mcp_servers": [{"name": "probe", "status": "connected", "source": "dynamic"}], "tools": ["mcp__probe__secret_word"], "model": "claude-haiku-5-5", "claude_code_version": "2.1.323"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "total_cost_usd": 0.00018744000000000003, "result": "Hi! I'm Claude, running as Haiku 5.5 in your terminal. What can I help you with today?", "stop_reason": "end_turn", "terminal_reason": "completed"}
