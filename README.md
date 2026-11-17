@@ -15,8 +15,8 @@ If the experiment's first run is `short` because the agent or the server failed,
 ## Needs
 
 - Node 20 or later, and Claude Code signed in (`claude`).
-- A server that reads its DSN from `BATON_DSN` and installs Baton with `settings="console"`. A DSN written in the server's code wins over the variable, and test traffic then goes to prod. Without `settings="console"` the change is ignored and every step is `short`.
-- A Baton SDK that understands `BATON_CANDIDATE` (Python 1.3.0 or later).
+- A server that reads its DSN from `BATON_DSN` and installs Baton with `settings="console"` (Python) or `settings: "console"` (TypeScript). A DSN written in the server's code wins over the variable, and test traffic then goes to prod. Without that setting the change is ignored and every step is `short`.
+- A Baton SDK that understands `BATON_CANDIDATE`: Python 1.3.0 or later, or `@goodtiming/baton-sdk` 1.2.0 or later.
 - macOS or Linux: the server starts through `/bin/sh`.
 
 ## Set up
