@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { launch, type ServerStart } from "./server.js";
 import { isObject, tryParseJson } from "./util.js";
 
-/** How the agent stopped. The runner, not the agent, turns this into pass, fail or short. */
+/** How the agent stopped. The runner turns all but `ok` into fail or short; the Console judges an `ok` run whose check worked. */
 type Stop = "ok" | "over_budget" | "no_server" | "error";
 
 export interface AgentRun {

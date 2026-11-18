@@ -1,6 +1,6 @@
 {
   "name": "baton-eval",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runs a server's agent tests for Baton auto mode: pulls steps from the Console, runs each task with a coding agent, reports pass, fail or short.",
   "license": "Apache-2.0",
   "repository": {

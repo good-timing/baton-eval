@@ -4,8 +4,6 @@ import { launch, type ServerStart } from "./server.js";
 import type { Check } from "./tasks.js";
 import { isObject, tryParseJson } from "./util.js";
 
-type Verdict = { outcome: "pass" | "fail" } | { outcome: "short"; reason: string };
-
 export type CallTool = (tool: string, args: Record<string, unknown>) => Promise<unknown>;
 
 /** Starts its own copy of the server and returns the tool's result as data. */
@@ -32,47 +30,32 @@ function textOf(content: unknown): string {
   return content.flatMap((c) => (isObject(c) && c.type === "text" && typeof c.text === "string" ? [c.text] : [])).join("\n");
 }
 
-export async function judge(check: Check, reply: string, callTool: CallTool): Promise<Verdict> {
-  let data: unknown;
-  const expression = check.reply_contains ?? check.reply_contains_any;
-  try {
-    data = await callTool(check.tool, check.args);
-  } catch (error) {
-    return { outcome: "short", reason: `the check call failed: ${(error as Error).message}` };
-  }
-  let value: unknown;
-  try {
-    value = select(data, expression);
-  } catch (error) {
-    return { outcome: "short", reason: (error as Error).message };
-  }
-  // No reply can name a blank or missing value, so it is dropped (units.test.ts: "is short, never a pass", "passes reply_contains_any").
-  const values = (Array.isArray(value) ? value : [value])
-    .map((v: unknown) => (typeof v === "string" ? normalize(v) : v))
-    .filter((v) => v !== "" && v !== null && v !== undefined);
-  if (values.length === 0) return { outcome: "short", reason: `${expression} gave nothing to look for` };
-  // A number or a date can be worded many ways ("seven", "12.35"), so every value must be text with a letter
-  // (units.test.ts: "which has no letter to look for").
-  if (!values.every((v): v is string => typeof v === "string" && /\p{L}/u.test(v))) {
-    return { outcome: "short", reason: `${expression} has a value that isn't text with a letter in it; only such text can be looked for` };
-  }
-  if (check.reply_contains !== undefined && values.length !== 1) {
-    return { outcome: "short", reason: `reply_contains needs one value, and ${expression} gave ${values.length}` };
-  }
-  const haystack = normalize(reply);
-  return { outcome: values.some((e) => mentionsWords(haystack, e)) ? "pass" : "fail" };
+export interface CheckReport extends Check {
+  result?: unknown;
+  picked?: unknown;
+  /** Why the check failed: the call errored, or `answer` found nothing or only blank values in its result. */
+  error?: string;
 }
 
-function normalize(text: string): string {
-  return text.normalize("NFKC").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').toLowerCase().replace(/\s+/g, " ").trim();
+/** Makes the check's call and picks the value at `answer`, for the Console's judge. */
+export async function runCheck(check: Check, callTool: CallTool): Promise<CheckReport> {
+  let result: unknown;
+  try {
+    result = await callTool(check.tool, check.args);
+  } catch (error) {
+    return { ...check, error: `the check call failed: ${(error as Error).message}` };
+  }
+  if (check.answer === undefined) return { ...check, result };
+  const found = select(result, check.answer);
+  if (found === undefined || (Array.isArray(found) && found.length === 0)) return { ...check, result, error: `${check.answer} found nothing in the result` };
+  // A blank value can't grade a reply, so the judge never gets one (units.test.ts: "blank values").
+  const picked = Array.isArray(found) ? found.filter((value) => !isBlank(value)) : found;
+  if (isBlank(picked) || (Array.isArray(picked) && picked.length === 0)) return { ...check, result, error: `${check.answer} found only blank values` };
+  return { ...check, result, picked };
 }
 
-const WORD_CHAR = "[\\p{L}\\p{M}\\p{N}_]";
-
-/** Whole words only, so "run" doesn't match "running". */
-function mentionsWords(haystack: string, needle: string): boolean {
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<!${WORD_CHAR})${escaped}(?!${WORD_CHAR})`, "u").test(haystack);
+function isBlank(value: unknown): boolean {
+  return value === null || (typeof value === "string" && value.trim() === "");
 }
 
 type Token = { key: string } | { index: number } | { first: number };
@@ -109,5 +92,9 @@ function walk(value: unknown, tokens: Token[]): unknown {
   }
   if (!Array.isArray(value)) return undefined;
   if ("index" in token) return walk(value[token.index], rest);
-  return value.slice(0, token.first).map((item) => walk(item, rest));
+  // A row missing the value is left out, so `[:n]` finds nothing only when no row has it.
+  return value.slice(0, token.first).flatMap((item) => {
+    const found = walk(item, rest);
+    return found === undefined ? [] : [found];
+  });
 }

@@ -6,7 +6,7 @@ import { isObject, isStringList, isStringRecord } from "./util.js";
 
 export const CONFIG_FILE = "baton-eval.toml";
 
-const SET_BY_RUNNER = new Set(["BATON_DSN", "BATON_CANDIDATE", "BATON_DISABLED"]);
+const SET_BY_RUNNER = new Set(["BATON_DSN", "BATON_CANDIDATE", "BATON_TASK", "BATON_DISABLED"]);
 
 interface Config {
   /** The server's slug: the last path segment of its DSN. */

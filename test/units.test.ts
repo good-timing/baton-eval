@@ -5,10 +5,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseOutput, type ProcessOutput } from "../src/agent.js";
-import { judge, parsePath, select } from "../src/check.js";
+import { parsePath, runCheck, select } from "../src/check.js";
 import { loadConfig, parseDsn, readDsn, saveDsn } from "../src/config.js";
 import { launch } from "../src/server.js";
-import { loadTasks, taskSetHash, writeHeldOut } from "../src/tasks.js";
+import { loadTasks, pickHeldOut, taskSetHash, writeHeldOut } from "../src/tasks.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 let dir: string;
@@ -19,8 +19,8 @@ beforeEach(() => {
 afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const SEED = [
-  { id: "top", prompt: "Most friction on {server} last week?", check: { tool: "top_friction_by_tool", args: { vendor_id: "{vendor_id}", window_days: 7 }, reply_contains: "rows[0].label" }, held_out: false },
-  { id: "gaps", prompt: "What to build next on {server}?", check: { tool: "top_gaps_clustered", args: { vendor_id: "{vendor_id}" }, reply_contains_any: "rows[:3].label" } },
+  { id: "top", prompt: "Most friction on {server} last week?", check: { tool: "top_friction_by_tool", args: { vendor_id: "{vendor_id}", window_days: 7 }, answer: "rows[0].label" }, held_out: false },
+  { id: "gaps", prompt: "What to build next on {server}?", check: { tool: "top_gaps_clustered", args: { vendor_id: "{vendor_id}" } } },
 ];
 const PLACEHOLDERS = { server: "Baton", vendor_id: "baton-mcp" };
 
@@ -35,7 +35,8 @@ describe("tasks", () => {
     const [top, gaps] = loadTasks(writeTasks(SEED), PLACEHOLDERS);
     expect(top).toMatchObject({ prompt: "Most friction on Baton last week?", held_out: false, tools: ["top_friction_by_tool"] });
     expect(top?.check.args).toEqual({ vendor_id: "baton-mcp", window_days: 7 });
-    expect(gaps?.check.reply_contains_any).toBe("rows[:3].label");
+    expect(top?.check.answer).toBe("rows[0].label");
+    expect(gaps?.check).not.toHaveProperty("answer");
     expect(gaps).not.toHaveProperty("held_out");
   });
 
@@ -45,11 +46,13 @@ describe("tasks", () => {
 
   it.each([
     [{ ...SEED[0], id: "has space" }, "id must be"],
-    [{ ...SEED[0], check: { tool: "t", args: {} } }, "exactly one of"],
-    [{ ...SEED[0], check: { tool: "t", reply_contains: null, reply_contains_any: "rows[:3].label" } }, "exactly one of"],
-    [{ ...SEED[0], check: { tool: "t", reply_contains: 0 } }, "exactly one of"],
+    [{ ...SEED[0], check: { tool: "t", reply_contains: "rows[0].label" } }, "are gone"],
+    [{ ...SEED[0], check: { tool: "t", reply_contains_any: "rows[:3].label" } }, "are gone"],
+    [{ ...SEED[0], check: { tool: "t", answer: 0 } }, "check.answer must be"],
     [{ ...SEED[0], held_out: "yes" }, "held_out"],
-    [{ ...SEED[0], check: { ...SEED[0]!.check, reply_contains: "rows[0]label" } }, "cannot read the check path"],
+    [{ ...SEED[0], check: { ...SEED[0]!.check, answer: "rows[0]label" } }, "cannot read the check path"],
+    [{ ...SEED[0], prompt: "{server}" + "x".repeat(3996) }, "over 4000"],
+    [{ ...SEED[0], check: { tool: "t", args: { q: "x".repeat(20_000) } } }, "top's check.args is over 20000"],
   ])("refuses a bad task", (bad, message) => {
     expect(() => loadTasks(writeTasks([bad]), PLACEHOLDERS)).toThrow(message);
   });
@@ -68,6 +71,20 @@ describe("tasks", () => {
     expect(fs.readFileSync(file, "utf8")).toContain("{vendor_id}");
   });
 
+  it("takes a prompt of 4000 characters, counted as the Console counts them", () => {
+    expect(loadTasks(writeTasks([{ ...SEED[0], prompt: "😀".repeat(4000) }]), PLACEHOLDERS)).toHaveLength(1);
+  });
+
+  it("picks 1 in 5 tasks to hold out, at least 1, only when the file marks none", () => {
+    const tasks = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `t${i}`, prompt: "p", check: { tool: "x" } }));
+    expect(pickHeldOut(writeTasks(tasks(1)))).toEqual([]);
+    expect(pickHeldOut(writeTasks(tasks(2)))).toHaveLength(1);
+    expect(pickHeldOut(writeTasks(tasks(14)))).toHaveLength(2);
+    expect(pickHeldOut(writeTasks(tasks(14)))).toEqual(pickHeldOut(writeTasks(tasks(14))));
+    expect(pickHeldOut(writeTasks([...tasks(9), { id: "x", prompt: "p", check: { tool: "x" }, held_out: false }]))).toEqual([]);
+    expect(pickHeldOut(path.join(dir, "missing.jsonl"))).toEqual([]);
+  });
+
   it("changes the hash when a task's content changes, whatever the order", () => {
     const hash = taskSetHash(loadTasks(writeTasks(SEED), PLACEHOLDERS));
     expect(taskSetHash(loadTasks(writeTasks([SEED[1], SEED[0]]), PLACEHOLDERS))).toBe(hash);
@@ -81,6 +98,7 @@ describe("check", () => {
   it("reads one value or the first n", () => {
     expect(select(data, "rows[0].label")).toBe("Search Docs");
     expect(select(data, "rows[:3].label")).toEqual(["Search Docs", "run_query", ""]);
+    expect(select({ rows: [{ label: "a" }, {}, { label: null }] }, "rows[:3].label")).toEqual(["a", null]);
     expect(select({ rows: "x" }, "rows[0].label")).toBeUndefined();
   });
 
@@ -89,59 +107,32 @@ describe("check", () => {
   });
 
   const call = (result: unknown) => async () => result;
+  const check = { tool: "t", args: { a: 1 }, answer: "rows[0].label" };
 
-  it("passes when the reply holds the value, ignoring case and spacing", async () => {
-    const check = { tool: "t", args: {}, reply_contains: "rows[0].label" };
-    expect(await judge(check, "It is search  docs.", call(data))).toEqual({ outcome: "pass" });
-    expect(await judge(check, "No idea.", call(data))).toEqual({ outcome: "fail" });
+  it("sends the call's result and the value at the answer path", async () => {
+    expect(await runCheck(check, call(data))).toEqual({ ...check, result: data, picked: "Search Docs" });
+    expect(await runCheck({ ...check, answer: "rows[:3].label" }, call(data))).toMatchObject({ picked: ["Search Docs", "run_query"] });
+    expect(await runCheck({ tool: "t", args: {} }, call(data))).toEqual({ tool: "t", args: {}, result: data });
   });
 
-  it("matches whole words only", async () => {
-    const label = { tool: "t", args: {}, reply_contains: "rows[0].label" };
-    expect(await judge(label, "I'm running it", call({ rows: [{ label: "run" }] }))).toEqual({ outcome: "fail" });
-    expect(await judge(label, "Use `run`.", call({ rows: [{ label: "run" }] }))).toEqual({ outcome: "pass" });
-    expect(await judge(label, "Use search_docs_v2", call({ rows: [{ label: "search_docs" }] }))).toEqual({ outcome: "fail" });
+  it("fails a check whose path found nothing, or only blank values", async () => {
+    for (const label of [null, "", "  "]) {
+      const result = { rows: [{ label }, { label: null }] };
+      expect(await runCheck(check, call(result))).toEqual({ ...check, result, error: "rows[0].label found only blank values" });
+      expect(await runCheck({ ...check, answer: "rows[:2].label" }, call(result))).toMatchObject({ error: "rows[:2].label found only blank values" });
+    }
+    for (const result of [{ rows: [] }, { rows: "x" }, {}]) {
+      expect(await runCheck(check, call(result))).toEqual({ ...check, result, error: "rows[0].label found nothing in the result" });
+    }
+    expect(await runCheck({ ...check, answer: "rows[:3].label" }, call({ rows: [] }))).toHaveProperty("error");
+    expect(await runCheck({ ...check, answer: "rows[:3].label" }, call({ rows: [{}] }))).toHaveProperty("error");
   });
 
-  it.each([5, 0.5, true, false, "5", "1,500", "2026-11-16"])("is short for the value %j, which has no letter to look for", async (value) => {
-    const check = { tool: "t", args: {}, reply_contains: "x" };
-    expect((await judge(check, String(value), call({ x: value }))).outcome).toBe("short");
-  });
-
-  it.each([
-    ["v2", "use v2.", "pass"],
-    ["v2", "use v20.", "fail"],
-    ["search_docs", "search_docs, then run_query", "pass"],
-    ["search_docs", "the search_docs-related errors", "pass"],
-    ["क", "कि", "fail"],
-  ])("matches the text %j in %j: %s", async (value, reply, outcome) => {
-    const check = { tool: "t", args: {}, reply_contains: "x" };
-    expect(await judge(check, reply, call({ x: value }))).toEqual({ outcome });
-  });
-
-  it("reads keys with dashes", async () => {
-    const check = { tool: "t", args: {}, reply_contains: "rows[0].is-open" };
-    expect(await judge(check, "It is search_docs.", call({ rows: [{ "is-open": "search_docs" }] }))).toEqual({ outcome: "pass" });
-  });
-
-  it("passes reply_contains_any on any of the values, and is short if one has no letter", async () => {
-    const check = { tool: "t", args: {}, reply_contains_any: "rows[:3].label" };
-    expect(await judge(check, "mostly RUN_QUERY", call(data))).toEqual({ outcome: "pass" });
-    expect(await judge(check, "It’s new", call({ rows: [{ label: "it's new" }] }))).toEqual({ outcome: "pass" });
-    expect((await judge(check, "the top one is 404", call({ rows: [{ label: "404" }, { label: "timeout" }] }))).outcome).toBe("short");
-  });
-
-  it("is short, never a pass, when there is nothing to look for or the call fails", async () => {
-    const check = { tool: "t", args: {}, reply_contains: "rows[0].label" };
-    expect((await judge(check, "anything", call({ rows: [] }))).outcome).toBe("short");
-    expect((await judge(check, "anything", call({ rows: [{ label: "  " }] }))).outcome).toBe("short");
-    const any = { tool: "t", args: {}, reply_contains_any: "rows[:3].label" };
-    expect((await judge(any, "anything", call({ rows: [] }))).outcome).toBe("short");
+  it("fails the check, without a result, when its call fails", async () => {
     const failing = async () => {
       throw new Error("down");
     };
-    expect(await judge(check, "anything", failing)).toMatchObject({ outcome: "short", reason: expect.stringContaining("down") });
-    expect((await judge({ tool: "t", args: {}, reply_contains: "rows[0]..x" }, "anything", call(data))).outcome).toBe("short");
+    expect(await runCheck(check, failing)).toEqual({ ...check, error: "the check call failed: down" });
   });
 });
 

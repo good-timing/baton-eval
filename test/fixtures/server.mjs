@@ -7,7 +7,7 @@ const server = new McpServer({ name: "fixture", version: "1" });
 server.registerTool("top_friction", { description: "Tools ranked by friction." }, async () => {
   const rows = process.env.FIXTURE_EMPTY ? [] : [{ label: "search_docs" }, { label: "run_query" }];
   if (process.env.FIXTURE_LOG) {
-    fs.appendFileSync(process.env.FIXTURE_LOG, JSON.stringify({ candidate: process.env.BATON_CANDIDATE, disabled: process.env.BATON_DISABLED, api: process.env.BATON_API_BASE_URL, dsn: process.env.BATON_DSN, cwd: process.cwd() }) + "\n");
+    fs.appendFileSync(process.env.FIXTURE_LOG, JSON.stringify({ candidate: process.env.BATON_CANDIDATE, task: process.env.BATON_TASK, disabled: process.env.BATON_DISABLED, api: process.env.BATON_API_BASE_URL, dsn: process.env.BATON_DSN, cwd: process.cwd() }) + "\n");
   }
   return { content: [{ type: "text", text: JSON.stringify({ rows }) }], structuredContent: { rows } };
 });

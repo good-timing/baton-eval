@@ -27,7 +27,7 @@ export function launch(server: ServerStart, options: { shieldSignals?: boolean }
 }
 
 /** The Baton SDK's own variables; a server's other BATON_ variables pass through. */
-const SDK_SETTINGS = new Set(["BATON_CANDIDATE", "BATON_DISABLED", "BATON_DSN", "BATON_TENANT_ID", "BATON_VENDOR_ID", "BATON_CONSENT_TOKEN"]);
+const SDK_SETTINGS = new Set(["BATON_CANDIDATE", "BATON_TASK", "BATON_DISABLED", "BATON_DSN", "BATON_TENANT_ID", "BATON_VENDOR_ID", "BATON_CONSENT_TOKEN"]);
 
 function withoutSdkSettings(env: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter(([key]) => !SDK_SETTINGS.has(key))) as Record<string, string>;

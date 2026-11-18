@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Agent, AgentRun } from "./agent.js";
-import { judge, type CallTool } from "./check.js";
-import { ConsoleError, type ConsoleApi, type Outcome, type ResultRow, type Step } from "./console.js";
+import { runCheck, type CallTool } from "./check.js";
+import { ConsoleError, type ConsoleApi, type Outcome, type ResultRow, type RowOutcome, type Step } from "./console.js";
 import type { ServerStart } from "./server.js";
 import { taskRefs, taskSetHash, type Task } from "./tasks.js";
 
@@ -9,7 +9,7 @@ export interface RunOptions {
   api: ConsoleApi;
   agent: Agent;
   tasks: Task[];
-  /** The server's start without the change; the runner adds BATON_DSN and BATON_CANDIDATE. */
+  /** The server's start without the change; the runner adds BATON_DSN, BATON_CANDIDATE and BATON_TASK. */
   server: ServerStart;
   dsn: string;
   callToolFor: (server: ServerStart) => CallTool;
@@ -65,7 +65,6 @@ export async function runExperiment(options: RunOptions): Promise<RunSummary> {
 async function runStep(options: RunOptions, experiment: string, step: Step, summary: RunSummary, log: (line: string) => void): Promise<void> {
   log(`step ${step.step}: change ${step.change_id}, ${step.task_ids.length} tasks x ${step.runs_per_task} runs${step.reason ? ` (${step.reason})` : ""}`);
   const testEnv = { ...options.server.env, BATON_DSN: options.dsn };
-  const server: ServerStart = { ...options.server, env: { ...testEnv, BATON_CANDIDATE: step.change_id } };
   // Baton is off for the check's own calls: they must not count as test traffic,
   // make a change look loaded, or become an issue a try targets (runner.test.ts: "runs each step's tasks").
   const callTool = options.callToolFor({ ...options.server, env: { ...testEnv, BATON_DISABLED: "1" } });
@@ -75,56 +74,68 @@ async function runStep(options: RunOptions, experiment: string, step: Step, summ
     if (!task) throw new Error(`the Console asked for task ${id}, which is not in the tasks file`);
     return Array.from({ length: step.runs_per_task }, (_, i) => ({ task, run: i + 1 }));
   });
-  const post = async (rows: ResultRow[]) => {
-    await options.api.results(experiment, step.step, rows);
-    for (const row of rows) summary.outcomes[row.outcome] += 1;
+  const post = async (rows: ResultRow[], detail?: string) => {
+    const outcomes = await options.api.results(experiment, step.step, rows);
+    for (const outcome of outcomes) {
+      summary.outcomes[outcome.outcome] += 1;
+      log(`  ${describe(outcome)}${detail ? `: ${detail}` : ""}`);
+    }
   };
 
   let loadedChecked = false;
   for (const [index, { task, run }] of sessions.entries()) {
+    const server: ServerStart = { ...options.server, env: { ...testEnv, BATON_CANDIDATE: step.change_id, BATON_TASK: task.id } };
     const agentRun = await options.agent.run(task.prompt, server);
-    const { outcome, reason } = await score(task, agentRun, callTool);
-    log(`  ${task.id} #${run}: ${outcome}${reason ? ` (${reason})` : ""}`);
-    const row = resultRow(task.id, run, outcome, agentRun, options.agent);
-    // A broken setup would make every run short, at a cost (runner.test.ts: "stops the experiment when its first run").
-    if (summary.steps === 1 && index === 0 && (agentRun.stop === "no_server" || agentRun.stop === "error")) {
-      await post([row]);
-      const hint = agentRun.stop === "no_server" ? "check that [start] in baton-eval.toml starts the server" : "fix the cause above, or run again if it was passing";
-      throw new Error(`the first run failed (${agentRun.detail}), so baton-eval stopped before spending more: ${hint}`);
-    }
     // Only a connected run that ended on its own has sent all its events
     // (runner.test.ts: "doesn't ask whether the change loaded after a run").
     if (!loadedChecked && (agentRun.stop === "ok" || agentRun.stop === "over_budget")) {
       loadedChecked = true;
       await agentRun.serverExited;
       if (!(await changeLoaded(options, experiment, step.step))) {
-        log(`  change ${step.change_id} did not load: no events tagged with it. Marking this step's runs short.`);
-        const rest = sessions.slice(index + 1).map((s): ResultRow => ({ task_id: s.task.id, run: s.run, outcome: "short" }));
-        await post([{ ...row, outcome: "short" }, ...rest]);
+        log(`  change ${step.change_id} did not load: no events tagged with it. Marking this step's runs short, which ends the experiment.`);
+        const notLoaded = { outcome: "short", reason: "not_loaded" } as const;
+        const rest = sessions.slice(index + 1).map((s): ResultRow => ({ task_id: s.task.id, run: s.run, ...notLoaded }));
+        await post([{ ...runRow(task.id, run, agentRun, options.agent), ...notLoaded }, ...rest]);
         return;
       }
     }
-    await post([row]);
+    const row = await resultRow(task, run, agentRun, callTool, options.agent);
+    const detail = agentRun.detail ?? row.check?.error;
+    // A broken setup would make every run short, at a cost (runner.test.ts: "stops the experiment when its first run").
+    if (summary.steps === 1 && index === 0 && row.reason === "crashed") {
+      await post([row], detail);
+      const hint = agentRun.stop === "no_server" ? "check that [start] in baton-eval.toml starts the server" : "fix the cause above, or run again if it was passing";
+      throw new Error(`the first run failed (${agentRun.detail}), so baton-eval stopped before spending more: ${hint}`);
+    }
+    await post([row], detail);
   }
 }
 
-async function score(task: Task, run: AgentRun, callTool: CallTool): Promise<{ outcome: Outcome; reason?: string | undefined }> {
-  switch (run.stop) {
+function describe(outcome: RowOutcome): string {
+  return `${outcome.task_id} #${outcome.run}: ${outcome.outcome}${outcome.reason ? ` (${outcome.reason})` : ""}`;
+}
+
+/** Sets the outcome only when the runner knows it; the Console judges the rest from the reply and the check. */
+async function resultRow(task: Task, run: number, agentRun: AgentRun, callTool: CallTool, agent: Agent): Promise<ResultRow> {
+  const row = runRow(task.id, run, agentRun, agent);
+  switch (agentRun.stop) {
     case "over_budget":
-      return { outcome: "fail", reason: "hit the dollar cap" };
+      return { ...row, outcome: "fail", reason: "dollar_cap" };
     case "no_server":
     case "error":
-      return { outcome: "short", reason: run.detail };
-    case "ok":
-      return judge(task.check, run.reply, callTool);
+      return { ...row, outcome: "short", reason: "crashed" };
+    case "ok": {
+      const check = await runCheck(task.check, callTool);
+      return check.error === undefined ? { ...row, check } : { ...row, outcome: "short", reason: "check_failed", check };
+    }
   }
 }
 
-function resultRow(taskId: string, run: number, outcome: Outcome, agentRun: AgentRun, agent: Agent): ResultRow {
+function runRow(taskId: string, run: number, agentRun: AgentRun, agent: Agent): ResultRow {
   return {
     task_id: taskId,
     run,
-    outcome,
+    reply: agentRun.reply,
     seconds: Math.round(agentRun.seconds * 10) / 10,
     agent: agent.name,
     model: agentRun.model ?? agent.model,

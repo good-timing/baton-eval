@@ -17,7 +17,7 @@ function task(id: string, extra: Partial<Task> = {}): Task {
   return {
     id,
     prompt: "Which tool has the most friction?",
-    check: { tool: "top_friction", args: {}, reply_contains: "rows[0].label" },
+    check: { tool: "top_friction", args: {}, answer: "rows[0].label" },
     tools: ["top_friction"],
     ...extra,
   };
@@ -72,7 +72,7 @@ async function childPid(): Promise<number> {
   return Number(fs.readFileSync(file, "utf8"));
 }
 
-type ServerCall = { candidate?: string; disabled?: string; api?: string; dsn: string; cwd: string };
+type ServerCall = { candidate?: string; task?: string; disabled?: string; api?: string; dsn: string; cwd: string };
 
 function serverLog(): ServerCall[] {
   if (!fs.existsSync(path.join(dir, "server.log"))) return [];
@@ -95,21 +95,31 @@ describe("runExperiment", () => {
     const { summary } = await run(consoleFake, [task("a"), task("b"), task("c", { held_out: true })]);
 
     expect(summary).toMatchObject({ experimentId: "exp_1", steps: 2, outcomes: { pass: 5, fail: 0, short: 0 } });
-    expect(consoleFake.results.map((r) => [r.step, r.task_id, r.run, r.outcome])).toEqual([
+    expect(consoleFake.results.map((r) => [r.step, r.sent.task_id, r.sent.run, r.outcome])).toEqual([
       [1, "a", 1, "pass"],
       [1, "a", 2, "pass"],
       [1, "b", 1, "pass"],
       [1, "b", 2, "pass"],
       [2, "a", 1, "pass"],
     ]);
-    expect(consoleFake.results[0]).toMatchObject({ agent: "claude-code", model: "test-model-1", cost_usd: 0.01, turns: 2 });
-    expect(consoleFake.results[0]).not.toHaveProperty("session_id");
+    expect(consoleFake.results[0]!.sent).toMatchObject({ agent: "claude-code", model: "test-model-1", cost_usd: 0.01, turns: 2 });
+    expect(consoleFake.results[0]!.sent).not.toHaveProperty("session_id");
+    expect(consoleFake.results[0]!.sent).not.toHaveProperty("outcome");
+    expect(consoleFake.results[0]!.sent.reply).toContain("search_docs");
+    expect(consoleFake.results[0]!.sent.check).toEqual({
+      tool: "top_friction",
+      args: {},
+      answer: "rows[0].label",
+      result: { rows: [{ label: "search_docs" }, { label: "run_query" }] },
+      picked: "search_docs",
+    });
 
     const started = consoleFake.started[0]!;
+    const prompt = "Which tool has the most friction?";
     expect(started.tasks).toEqual([
-      { id: "a", tools: ["top_friction"] },
-      { id: "b", tools: ["top_friction"] },
-      { id: "c", held_out: true, tools: ["top_friction"] },
+      { id: "a", prompt, tools: ["top_friction"] },
+      { id: "b", prompt, tools: ["top_friction"] },
+      { id: "c", prompt, held_out: true, tools: ["top_friction"] },
     ]);
     expect(started.task_set_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(started.agents).toEqual(["claude-code:test-model"]);
@@ -117,7 +127,9 @@ describe("runExperiment", () => {
     const calls = serverLog();
     const agentCalls = calls.filter((c) => c.candidate !== undefined);
     expect(agentCalls.map((c) => c.candidate)).toEqual(["chg_base", "chg_base", "chg_base", "chg_base", "chg_try1"]);
+    expect(agentCalls.map((c) => c.task)).toEqual(["a", "a", "b", "b", "a"]);
     const checkCalls = calls.filter((c) => c.candidate === undefined);
+    expect(checkCalls.every((c) => c.task === undefined)).toBe(true);
     expect(checkCalls).toHaveLength(5);
     expect(checkCalls.every((c) => c.disabled === "1")).toBe(true);
     expect(agentCalls.every((c) => c.disabled === undefined)).toBe(true);
@@ -125,17 +137,20 @@ describe("runExperiment", () => {
     expect(new Set(calls.map((c) => fs.realpathSync(c.cwd)))).toEqual(new Set([fs.realpathSync(path.join(dir, "serverdir"))]));
   });
 
-  it("marks every run of a step short when its change did not load, and stops running it", async () => {
+  it("marks every run of a step not_loaded when its change did not load, in one post, and stops running it", async () => {
     consoleFake = await fakeConsole({
-      steps: [{ change_id: "chg_base", task_ids: ["a", "b"], runs_per_task: 2, tagged_events: 0 }],
+      steps: [{ change_id: "chg_base", task_ids: ["a", "b"], runs_per_task: 15, tagged_events: 0 }],
     });
     const { summary, lines } = await run(consoleFake, [task("a"), task("b")]);
 
-    expect(consoleFake.results.map((r) => r.outcome)).toEqual(["short", "short", "short", "short"]);
-    expect(consoleFake.results[0]).toMatchObject({ cost_usd: 0.01, turns: 2 });
-    expect(summary.outcomes.short).toBe(4);
+    expect(consoleFake.posts).toBe(1);
+    expect(consoleFake.results.map((r) => [r.outcome, r.reason])).toEqual(Array(30).fill(["short", "not_loaded"]));
+    expect(consoleFake.results[0]!.sent).toMatchObject({ cost_usd: 0.01, turns: 2 });
+    expect(consoleFake.results[0]!.sent).not.toHaveProperty("check");
+    expect(serverLog().filter((c) => c.disabled === "1")).toHaveLength(0);
+    expect(summary.outcomes.short).toBe(30);
     expect(consoleFake.loadedCalls).toBe(2);
-    expect(serverLog()).toHaveLength(2);
+    expect(serverLog()).toHaveLength(1);
     expect(lines.join("\n")).toContain("did not load");
   });
 
@@ -144,12 +159,13 @@ describe("runExperiment", () => {
       steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }],
     });
     process.env.BATON_CANDIDATE = "chg_stale";
+    process.env.BATON_TASK = "stale";
     process.env.BATON_DISABLED = "1";
     process.env.BATON_API_BASE_URL = "https://api.example";
     await run(consoleFake, [task("a")]);
-    expect(serverLog().map((c) => [c.candidate, c.disabled, c.api])).toEqual([
-      ["chg_base", undefined, "https://api.example"],
-      [undefined, "1", "https://api.example"],
+    expect(serverLog().map((c) => [c.candidate, c.task, c.disabled, c.api])).toEqual([
+      ["chg_base", "a", undefined, "https://api.example"],
+      [undefined, undefined, "1", "https://api.example"],
     ]);
   });
 
@@ -180,7 +196,7 @@ describe("runExperiment", () => {
     });
     process.env.FAKE_CLAUDE_MODE = mode;
     await expect(run(consoleFake, [task("a")])).rejects.toThrow("the first run failed");
-    expect(consoleFake.results.map((r) => r.outcome)).toEqual(["short"]);
+    expect(consoleFake.results.map((r) => [r.outcome, r.reason])).toEqual([["short", "crashed"]]);
     expect(fs.readFileSync(process.env.FAKE_CLAUDE_STATE!, "utf8")).toBe("1");
   });
 
@@ -206,13 +222,15 @@ describe("runExperiment", () => {
     expect(consoleFake.results.map((r) => r.outcome)).toEqual(["short", "short"]);
   });
 
-  it("retries a results post the Console could not take", async () => {
+  it("resends a post whose judge failed", async () => {
     consoleFake = await fakeConsole({
       steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }],
-      unavailableResults: 2,
+      judgeFailures: 2,
     });
-    await run(consoleFake, [task("a")]);
+    const { lines } = await run(consoleFake, [task("a")]);
+    expect(consoleFake.posts).toBe(3);
     expect(consoleFake.results.map((r) => r.outcome)).toEqual(["pass"]);
+    expect(lines).toContain("  a #1: pass");
   });
 
   it("stops with a clear error on a next step it doesn't know", async () => {
@@ -283,13 +301,14 @@ describe("runExperiment", () => {
     expect(Date.now() - started).toBeLessThan(8000);
   });
 
-  it("scores a wrong reply as fail and the dollar cap as fail", async () => {
+  it("leaves a wrong reply to the judge, and sends the dollar cap as fail", async () => {
     consoleFake = await fakeConsole({
       steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }],
     });
     process.env.FAKE_CLAUDE_MODE = "wrong";
     await run(consoleFake, [task("a")]);
-    expect(consoleFake.results[0]?.outcome).toBe("fail");
+    expect(consoleFake.results[0]).toMatchObject({ outcome: "fail", sent: { reply: "I could not tell." } });
+    expect(consoleFake.results[0]!.sent).not.toHaveProperty("outcome");
 
     await consoleFake.close();
     consoleFake = await fakeConsole({
@@ -297,16 +316,21 @@ describe("runExperiment", () => {
     });
     process.env.FAKE_CLAUDE_MODE = "budget";
     await run(consoleFake, [task("a")]);
-    expect(consoleFake.results[0]).toMatchObject({ outcome: "fail", cost_usd: 1.02 });
+    expect(consoleFake.results[0]!.sent).toMatchObject({ outcome: "fail", reason: "dollar_cap", cost_usd: 1.02 });
   });
 
-  it("scores a run short when the check finds nothing to look for", async () => {
+  it("sends a run as check_failed, with the result, when the answer path finds nothing", async () => {
     consoleFake = await fakeConsole({
       steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }],
     });
     process.env.FIXTURE_EMPTY = "1";
-    await run(consoleFake, [task("a")]);
-    expect(consoleFake.results[0]?.outcome).toBe("short");
+    const { lines } = await run(consoleFake, [task("a")]);
+    expect(consoleFake.results[0]!.sent).toMatchObject({
+      outcome: "short",
+      reason: "check_failed",
+      check: { result: { rows: [] }, error: "rows[0].label found nothing in the result" },
+    });
+    expect(lines).toContain("  a #1: short (check_failed): rows[0].label found nothing in the result");
   });
 
   it("stops cleanly when the Console says the budget is spent", async () => {
@@ -327,6 +351,12 @@ describe("runExperiment", () => {
     await run(consoleFake, [task("a", { held_out: false }), task("b")], { onHeldOutPicked: (ids) => picked.push(ids) });
     expect(picked).toEqual([["b"]]);
     expect(consoleFake.started[0]!.tasks.map((t) => t.held_out)).toEqual([undefined, undefined]);
+  });
+
+  it("replaces NUL in the prompts it sends at start", async () => {
+    consoleFake = await fakeConsole({ steps: [] });
+    await run(consoleFake, [task("a", { prompt: "a\0b" })]);
+    expect(consoleFake.started[0]!.tasks[0]!.prompt).toBe("a\uFFFDb");
   });
 
   it("warns when no task is held out", async () => {
@@ -370,5 +400,46 @@ describe("runExperiment", () => {
     expect(env).not.toHaveProperty("BATON_CANDIDATE");
     expect(serverLog()[0]?.candidate).toBe("chg_base");
     expect(cwd).not.toBe(process.cwd());
+  });
+});
+
+describe("ConsoleApi.results", () => {
+  it("doesn't resend a post to a Console with no judge", async () => {
+    consoleFake = await fakeConsole({ steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }], noJudge: true });
+    const api = new ConsoleApi(consoleFake.origin, consoleFake.key, { retryDelaysMs: [1, 1, 1] });
+    await expect(api.results("exp_1", 1, [{ task_id: "a", run: 1, outcome: "short", reason: "crashed" }])).rejects.toThrow("no_judge");
+    expect(consoleFake.posts).toBe(1);
+  });
+
+  it.each(["drop", "misname"] as const)("refuses an answer that doesn't give every row's outcome (%s)", async (badOutcomes) => {
+    consoleFake = await fakeConsole({ steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 2, tagged_events: 1 }], badOutcomes });
+    const api = new ConsoleApi(consoleFake.origin, consoleFake.key, { retryDelaysMs: [] });
+    const row = { task_id: "a", run: 1, outcome: "short", reason: "crashed" } as const;
+    await expect(api.results("exp_1", 1, [row, { ...row, run: 2 }])).rejects.toThrow("unexpected answer");
+  });
+
+  it("fits a row to the Console's limits: long text cut, NUL and lone surrogates replaced, at most 20 rows a post", async () => {
+    consoleFake = await fakeConsole({
+      steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 45, tagged_events: 1 }],
+    });
+    const api = new ConsoleApi(consoleFake.origin, consoleFake.key, { retryDelaysMs: [] });
+    const long = "é".repeat(20_001);
+    const rows = Array.from({ length: 45 }, (_, i) => ({
+      task_id: "a",
+      run: i + 1,
+      reply: i === 0 ? `${"😀".repeat(20_000)}x` : i === 1 ? "it is a\0b\uD800 and \\u0000" : "fine",
+      check: { tool: "t", args: {}, answer: "x", result: i === 0 ? { x: long } : { x: "b" }, picked: i === 0 ? [long] : "b", ...(i === 0 ? { error: long } : {}) },
+    }));
+    const outcomes = await api.results("exp_1", 1, rows);
+    expect(consoleFake.posts).toBe(3);
+    expect(outcomes).toHaveLength(45);
+    const [first, second] = consoleFake.results.map((r) => r.sent);
+    expect(first).toMatchObject({ truncated: true, reply: "😀".repeat(20_000) });
+    expect(typeof first!.check!.result).toBe("string");
+    expect(Array.from(first!.check!.result as string)).toHaveLength(20_000);
+    expect(typeof first!.check!.picked).toBe("string");
+    expect(Array.from(first!.check!.error!)).toHaveLength(20_000);
+    expect(second).not.toHaveProperty("truncated");
+    expect(second!.reply).toBe("it is a\uFFFDb\uFFFD and \\u0000");
   });
 });

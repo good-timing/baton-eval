@@ -9,7 +9,7 @@ import { callToolOn } from "./check.js";
 import { CONFIG_FILE, loadConfig, parseDsn, readDsn, renderConfig, saveDsn, credentialsPath } from "./config.js";
 import { ConsoleApi } from "./console.js";
 import { runExperiment } from "./runner.js";
-import { loadTasks, writeHeldOut } from "./tasks.js";
+import { loadTasks, pickHeldOut, writeHeldOut } from "./tasks.js";
 
 const USAGE = `Usage:
   baton-eval init --server <slug> --tasks <file> --model <model> [--max-budget-usd <n>] [--force] [--replace-dsn] -- <command> [args...]
@@ -59,6 +59,7 @@ async function init(argv: string[]): Promise<void> {
   if (fs.existsSync(CONFIG_FILE) && !values.force) {
     throw new Error(`${CONFIG_FILE} already exists; pass --force to replace it`);
   }
+  const heldOut = pickHeldOut(values.tasks);
   const raw = process.env.BATON_EVAL_DSN || (await readStdin());
   if (!raw) throw new Error("no test DSN given: set BATON_EVAL_DSN or pipe it on stdin");
   const dsn = parseDsn(raw, values.server);
@@ -68,6 +69,10 @@ async function init(argv: string[]): Promise<void> {
     renderConfig({ server: values.server, tasks: values.tasks, command, args, model: values.model, maxBudgetUsd }),
   );
   log(`wrote ${CONFIG_FILE}; saved the test DSN for ${values.server} to ${credentialsPath()}`);
+  if (heldOut.length > 0) {
+    writeHeldOut(values.tasks, heldOut);
+    log(`marked ${heldOut.join(", ")} held_out in ${values.tasks}; the Console runs held-out tasks only at the final step, to confirm a change. Review the pick.`);
+  }
   log(`fill [placeholders] in ${CONFIG_FILE} if the tasks use any, then run: npx baton-eval run`);
 }
 

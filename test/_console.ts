@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { text } from "node:stream/consumers";
-import type { ResultRow, TaskRef } from "../src/console.js";
+import type { Outcome, ResultRow, TaskRef } from "../src/console.js";
 
 export interface FakeStep {
   change_id: string;
@@ -17,7 +17,9 @@ export interface FakeConsole {
   origin: string;
   key: string;
   started: { tasks: TaskRef[]; task_set_hash: string; agents?: string[] }[];
-  results: (ResultRow & { step: number })[];
+  /** Each row as sent, with the outcome the Console stored for it. */
+  results: { step: number; outcome: Outcome; reason?: string | undefined; sent: ResultRow }[];
+  posts: number;
   loadedCalls: number;
   close(): Promise<void>;
 }
@@ -30,14 +32,18 @@ export async function fakeConsole(options: {
   budgetSessions?: number;
   /** Answer /next with this instead of the scripted steps. */
   nextAnswer?: unknown;
-  /** Answer this many results posts with 503 first. */
-  unavailableResults?: number;
+  /** Answer this many results posts with 503 judge_failed first. */
+  judgeFailures?: number;
+  /** Answer every results post with 503 no_judge. */
+  noJudge?: boolean;
+  /** Breaks the answer to a results post: one outcome missing, or one naming a run that wasn't sent. */
+  badOutcomes?: "drop" | "misname";
 }): Promise<FakeConsole> {
   const key = "baton_tk_testkey0123456789";
-  const state: FakeConsole = { origin: "", key, started: [], results: [], loadedCalls: 0, close: async () => {} };
+  const state: FakeConsole = { origin: "", key, started: [], results: [], posts: 0, loadedCalls: 0, close: async () => {} };
   let stepIndex = 0;
   let waits = options.waitsBeforeFirstStep ?? 0;
-  let unavailable = options.unavailableResults ?? 0;
+  let judgeFailures = options.judgeFailures ?? 0;
   const budget = options.budgetSessions ?? 400;
 
   const server = http.createServer((req, res) => {
@@ -50,6 +56,7 @@ export async function fakeConsole(options: {
       if (req.headers.authorization !== `Bearer ${key}`) return error(403, "not_a_test_key");
       const url = req.url ?? "";
       if (req.method === "POST" && url === "/v0/experiments") {
+        if (unstorable(JSON.parse(body))) return error(422, "unstorable_text");
         const parsed = JSON.parse(body) as FakeConsole["started"][number];
         state.started.push(parsed);
         return send(201, { experiment_id: "exp_1", held_out: options.heldOut ?? [], budget_sessions: budget });
@@ -72,20 +79,32 @@ export async function fakeConsole(options: {
         return send(200, { tagged_events: arrived ? step.tagged_events : 0 });
       }
       if (match && step && match[2] === "results" && req.method === "POST") {
-        if (unavailable > 0) {
-          unavailable -= 1;
-          return error(503, "unavailable");
-        }
+        state.posts += 1;
+        if (options.noJudge) return error(503, "no_judge");
+        // A not_loaded row ends the experiment.
+        if (state.results.some((r) => r.reason === "not_loaded")) return error(409, "step_not_running");
         const rows = (JSON.parse(body) as { results: ResultRow[] }).results;
+        const refused = rows.map(refusal).find((code) => code !== undefined);
+        if (refused) return error(422, refused);
+        if (rows.filter((r) => r.outcome === undefined).length > 20) return error(422, "too_many_to_judge");
+        if (judgeFailures > 0 && rows.some((r) => r.outcome === undefined)) {
+          judgeFailures -= 1;
+          return error(503, "judge_failed");
+        }
+        const outcomes = [];
         for (const row of rows) {
           if (!step.task_ids.includes(row.task_id)) return error(422, "task_not_in_step");
           if (state.results.length >= budget) return error(409, "budget_spent");
-          state.results.push({ ...row, step: Number(match[1]) });
+          const stored = row.outcome === undefined ? { outcome: judge(row) } : { outcome: row.outcome, reason: row.reason };
+          state.results.push({ ...stored, step: Number(match[1]), sent: row });
+          outcomes.push({ task_id: row.task_id, run: row.run, ...stored });
         }
         if (state.results.filter((r) => r.step === Number(match[1])).length === step.task_ids.length * step.runs_per_task) {
           stepIndex += 1;
         }
-        return send(200, { added: rows.length, spent_sessions: state.results.length });
+        if (options.badOutcomes === "drop") outcomes.pop();
+        if (options.badOutcomes === "misname" && outcomes[0]) outcomes[0] = { ...outcomes[0], run: 99 };
+        return send(200, { added: rows.length, spent_sessions: state.results.length, outcomes });
       }
       return error(404, "not_found");
     });
@@ -94,4 +113,30 @@ export async function fakeConsole(options: {
   state.origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   state.close = () => new Promise((resolve) => server.close(() => resolve()));
   return state;
+}
+
+/** Stands in for the Console's judge: a pass when the reply names the picked value. */
+function judge(row: ResultRow): Outcome {
+  const picked = row.check?.picked;
+  const values = (Array.isArray(picked) ? picked : [picked]).map(String);
+  return values.some((value) => row.reply?.toLowerCase().includes(value.toLowerCase())) ? "pass" : "fail";
+}
+
+/** A real NUL or a lone surrogate anywhere, which Postgres can't store; the six characters \\u0000 are fine. */
+function unstorable(value: unknown): boolean {
+  if (typeof value === "string") return value.includes("\0") || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
+  if (Array.isArray(value)) return value.some(unstorable);
+  if (value !== null && typeof value === "object") return Object.entries(value).some(([k, v]) => unstorable(k) || unstorable(v));
+  return false;
+}
+
+/** What the Console refuses in a row: its error code, or undefined. */
+function refusal(row: ResultRow): string | undefined {
+  if (row.outcome !== undefined && row.outcome !== "fail" && row.outcome !== "short") return "bad_outcome";
+  if (row.outcome === undefined && (row.reply === undefined || row.check?.result === undefined)) return "missing_reply_or_check";
+  const text = (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value));
+  const fields = [row.reply, row.check?.error, row.check?.args, row.check?.result, row.check?.picked].filter((v) => v !== undefined);
+  if (fields.some((value) => Array.from(text(value)).length > 20_000)) return "too_long";
+  if (unstorable(row)) return "unstorable_text";
+  return undefined;
 }
