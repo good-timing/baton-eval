@@ -1,9 +1,11 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Agent, AgentRun } from "./agent.js";
 import { runCheck, type CallTool } from "./check.js";
-import { ConsoleError, type ConsoleApi, type Outcome, type ResultRow, type RowOutcome, type Step } from "./console.js";
+import { ConsoleError, type ConsoleApi, type Outcome, type ResultRow, type RowOutcome, type Status, type Step } from "./console.js";
 import type { ServerStart } from "./server.js";
 import { taskRefs, taskSetHash, type Task } from "./tasks.js";
+import { withFreshHint, type Fix } from "./last.js";
+import { oneLine } from "./util.js";
 
 export interface RunOptions {
   api: ConsoleApi;
@@ -14,6 +16,8 @@ export interface RunOptions {
   dsn: string;
   callToolFor: (server: ServerStart) => CallTool;
   budgetSessions?: number | undefined;
+  /** Without it, the experiment is a find. */
+  fix?: Fix | undefined;
   /** Called when the Console picked the held-out tasks because the file marked none. */
   onHeldOutPicked?: (ids: string[]) => void;
   log?: (line: string) => void;
@@ -27,18 +31,28 @@ interface RunSummary {
   steps: number;
   outcomes: Record<Outcome, number>;
   stoppedFor?: string;
+  /** The Console's verdict; absent when reading it failed. */
+  status?: Status;
+  statusError?: string;
 }
 
 export async function runExperiment(options: RunOptions): Promise<RunSummary> {
   const log = options.log ?? (() => {});
-  const started = await options.api.start({
+  const body = {
     tasks: taskRefs(options.tasks),
     task_set_hash: taskSetHash(options.tasks),
-    agents: [`${options.agent.name}:${options.agent.model}`],
+    agents: [agentId(options.agent)],
     budget_sessions: options.budgetSessions,
-  });
+  };
+  const fix = options.fix;
+  const started = fix?.from
+    ? await options.api.fixFrom(fix.from, { ...body, issue: fix.issue }).catch((error: unknown) => {
+        throw withFreshHint(error);
+      })
+    : await options.api.start({ ...body, issue: fix?.issue });
   const experiment = started.experiment_id;
   log(`experiment ${experiment}: ${options.tasks.length} tasks, budget ${started.budget_sessions} sessions`);
+  if (started.url) log(`page ${started.url}`);
   if (options.tasks.every((t) => t.held_out === undefined) && started.held_out.length > 0) {
     options.onHeldOutPicked?.(started.held_out);
   }
@@ -59,7 +73,17 @@ export async function runExperiment(options: RunOptions): Promise<RunSummary> {
     if (!(error instanceof ConsoleError && error.code === "budget_spent")) throw error;
     summary.stoppedFor = "the experiment's budget is spent";
   }
+  try {
+    summary.status = await options.api.status(experiment, options.server.name);
+  } catch (error) {
+    // The runs are done and paid for; only reading the verdict failed.
+    summary.statusError = (error as Error).message;
+  }
   return summary;
+}
+
+export function agentId(agent: Agent): string {
+  return `${agent.name}:${agent.model}`;
 }
 
 async function runStep(options: RunOptions, experiment: string, step: Step, summary: RunSummary, log: (line: string) => void): Promise<void> {
@@ -78,7 +102,8 @@ async function runStep(options: RunOptions, experiment: string, step: Step, summ
     const outcomes = await options.api.results(experiment, step.step, rows);
     for (const outcome of outcomes) {
       summary.outcomes[outcome.outcome] += 1;
-      log(`  ${describe(outcome)}${detail ? `: ${detail}` : ""}`);
+      const why = (outcome.outcome === "fail" && outcome.note ? oneLine(outcome.note) : "") || detail;
+      log(`  ${describe(outcome)}${why ? `: ${why}` : ""}`);
     }
   };
 

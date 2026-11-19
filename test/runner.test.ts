@@ -6,11 +6,12 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ClaudeCode, finishLeftovers, killActiveRuns } from "../src/agent.js";
 import { callToolOn } from "../src/check.js";
-import { ConsoleApi } from "../src/console.js";
+import { ConsoleApi, type Status } from "../src/console.js";
 import { runExperiment, type RunOptions } from "../src/runner.js";
 import type { Task } from "../src/tasks.js";
 import { fakeConsole, type FakeConsole } from "./_console.js";
 
+const ISSUE = "1".repeat(16) + "." + "2".repeat(16);
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 function task(id: string, extra: Partial<Task> = {}): Task {
@@ -333,7 +334,53 @@ describe("runExperiment", () => {
     expect(lines).toContain("  a #1: short (check_failed): rows[0].label found nothing in the result");
   });
 
-  it("stops cleanly when the Console says the budget is spent", async () => {
+  it("finds: starts with no issue, logs the page, and ends with the Console's status", async () => {
+    const status: Status = { kind: "find", state: "done", verdict: null, reason: null, issues: [] };
+    consoleFake = await fakeConsole({ steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }], status });
+    const { summary, lines } = await run(consoleFake, [task("a")]);
+    expect(consoleFake.started[0]).not.toHaveProperty("issue");
+    expect(lines[1]).toBe("page https://console.test/autopilot/exp_1");
+    expect(summary.status).toEqual({ experiment_id: "exp_1", ...status });
+  });
+
+  it("keeps the finished runs when reading the result fails", async () => {
+    consoleFake = await fakeConsole({ steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }], statusFails: true });
+    const { summary } = await run(consoleFake, [task("a")]);
+    expect(summary.outcomes.pass).toBe(1);
+    expect(summary.status).toBeUndefined();
+    expect(summary.statusError).toContain("500 unavailable");
+  });
+
+  it("fixes on a find's runs: /fix gets every task and the agent; a fresh fix starts with the issue", async () => {
+    const steps = [{ change_id: "chg_try1", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }];
+    consoleFake = await fakeConsole({ steps });
+    await run(consoleFake, [task("a"), task("b", { held_out: true })], { fix: { issue: ISSUE, from: "exp_0" } });
+    expect(consoleFake.started).toEqual([]);
+    expect(consoleFake.fixed).toHaveLength(1);
+    expect(consoleFake.fixed[0]).toMatchObject({ find: "exp_0", body: { issue: ISSUE, agents: ["claude-code:test-model"] } });
+    expect(consoleFake.fixed[0]!.body.tasks.map((t) => [t.id, t.held_out])).toEqual([["a", undefined], ["b", true]]);
+
+    await consoleFake.close();
+    consoleFake = await fakeConsole({ steps });
+    await run(consoleFake, [task("a")], { fix: { issue: ISSUE } });
+    expect(consoleFake.fixed).toEqual([]);
+    expect(consoleFake.started[0]).toMatchObject({ issue: ISSUE });
+  });
+
+  it("names --fresh when the Console refuses to reuse the last run", async () => {
+    consoleFake = await fakeConsole({ steps: [], fixRefusal: "tasks_changed" });
+    const error: unknown = await run(consoleFake, [task("a")], { fix: { issue: ISSUE, from: "exp_0" } }).catch((e: unknown) => e);
+    expect(String(error)).toMatch(/409 tasks_changed .*pass --fresh/);
+  });
+
+  it("shows the judge's note, on one line, on a fail", async () => {
+    consoleFake = await fakeConsole({ steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 1, tagged_events: 1 }], note: "named run_query\nnot search_docs" });
+    process.env.FAKE_CLAUDE_MODE = "wrong";
+    const { lines } = await run(consoleFake, [task("a")]);
+    expect(lines).toContain("  a #1: fail: named run_query");
+  });
+
+  it("stops cleanly when the Console says the budget is spent, and still reads the verdict", async () => {
     consoleFake = await fakeConsole({
       steps: [{ change_id: "chg_base", task_ids: ["a"], runs_per_task: 3, tagged_events: 1 }],
       budgetSessions: 2,
@@ -341,6 +388,7 @@ describe("runExperiment", () => {
     const { summary } = await run(consoleFake, [task("a")]);
     expect(consoleFake.results).toHaveLength(2);
     expect(summary.stoppedFor).toContain("budget");
+    expect(summary.status).toMatchObject({ kind: "find" });
   });
 
   it("hands back the Console's held-out pick only when the file marked none", async () => {
@@ -400,6 +448,34 @@ describe("runExperiment", () => {
     expect(env).not.toHaveProperty("BATON_CANDIDATE");
     expect(serverLog()[0]?.candidate).toBe("chg_base");
     expect(cwd).not.toBe(process.cwd());
+  });
+});
+
+describe("ConsoleApi.status", () => {
+  it("accepts each of the Console's real answers", async () => {
+    const examples = JSON.parse(fs.readFileSync(path.join(fixtures, "status-examples.json"), "utf8")) as Record<string, Status>;
+    for (const status of Object.values(examples)) {
+      consoleFake = await fakeConsole({ steps: [], status });
+      await expect(new ConsoleApi(consoleFake.origin, consoleFake.key).status("exp_1", "fixture")).resolves.toMatchObject({ kind: status.kind });
+      await consoleFake.close();
+      consoleFake = undefined;
+    }
+  });
+
+  it("reads a fix's error counts, and refuses broken ones", async () => {
+    const result = { targets: { before: [20, 20], after: [20, 20] }, guard: null, held_out: null };
+    const fix = (errors: unknown) => ({ kind: "fix", state: "done", verdict: "helped", reason: null, issue: ISSUE, result: { ...result, errors } }) as unknown as Status;
+    const errors = { before: [13, 20], after: [0, 20] };
+    consoleFake = await fakeConsole({ steps: [], status: fix(errors) });
+    await expect(new ConsoleApi(consoleFake.origin, consoleFake.key).status("exp_1", "fixture")).resolves.toMatchObject({ result: { errors } });
+    await consoleFake.close();
+    consoleFake = await fakeConsole({ steps: [], status: fix({ before: [13, 20] }) });
+    await expect(new ConsoleApi(consoleFake.origin, consoleFake.key, { retryDelaysMs: [] }).status("exp_1", "fixture")).rejects.toThrow();
+  });
+
+  it("refuses an issue that isn't text, since it goes into a report line", async () => {
+    consoleFake = await fakeConsole({ steps: [], status: { kind: "fix", state: "done", verdict: "helped", reason: null, issue: { id: 1 } } as unknown as Status });
+    await expect(new ConsoleApi(consoleFake.origin, consoleFake.key, { retryDelaysMs: [] }).status("exp_1", "fixture")).rejects.toThrow();
   });
 });
 

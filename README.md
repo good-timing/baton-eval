@@ -74,10 +74,40 @@ One JSON object per line:
 - `held_out`: tasks read only at the experiment's final step. If no task has `held_out` at `run`, the Console picks some and `run` writes the pick back to the file for you to review. Any `held_out`, even `false`, counts as your pick: then only tasks marked `true` are held out, and with none the Console can't confirm a change.
 - `tools` (optional): the tools the task should use. It defaults to `[check.tool]`.
 
-## Run
+## Find issues
 
 ```sh
 npx baton-eval run
 ```
 
-It starts an experiment, runs every step the Console hands out, and stops when the Console says it's done or the budget is spent.
+It runs every task that isn't held out, 10 times each, and lists the issues the Console found, most important first:
+
+```
+experiment exp_abc: found 2 issues
+issue 1. 0123456789abcdef.fedcba9876543210 text tool=friction_on prod_sessions=12 tasks=friction-on-day below_bar=no page=https://…: invalid day format
+issue 2. 1111222233334444.5555666677778888 code tool=run_query prod_sessions=3 tasks=- below_bar=yes page=https://…: timeout
+```
+
+Each line gives the issue's id, the kind of fix it needs (only `text` can be tested here), the tool, how many real sessions hit it, which tasks hit it (`-` for none), whether it is still too rare to fix (`below_bar`), its page, and the error. With no issues, the line is `experiment <id>: found no issues`.
+
+`run` saves the experiment's id in `.baton-eval/last.json`, next to `baton-eval.toml`, so a fix can reuse its runs. A fix made on those runs whose try was judged replaces it, so the next fix reuses that fix's runs too. A `--fresh` fix doesn't, so after one, run a find again to make the next fixes cheap. The folder has its own `.gitignore`, so git ignores it.
+
+## Test a fix
+
+```sh
+npx baton-eval run --issue 0123456789abcdef.fedcba9876543210
+```
+
+The Console tests the issue's proposed fix on the tasks that hit it, checks that the other tasks still pass, and then checks the held-out tasks. It reuses the runs of the last find or fix, so only the fix is paid for. A task you add, such as one that reproduces an issue no task hit, gets its own 10 runs once, the first time a fix runs with it. Before the final summary line, it prints the verdict:
+
+```
+experiment exp_def: fix 0123456789abcdef.fedcba9876543210: helped; targets 3/10 -> 10/10; error 7/10 -> 0/10; guard held; held-out held
+```
+
+The verdict is `helped`, `no_better`, `worse`, `hurt_held_out`, or `ended (<reason>)`, such as `ended (no_task_hits)` when no task hit the issue.
+
+`targets` counts passes on the tasks that hit the issue, before and after the fix. `error` counts the runs that hit the issue's error, when the Console could read them. A fix also counts as `helped` when its error happens clearly less often and passes on the tasks that hit it don't drop by more than the Console's margin.
+
+If a task changed or was removed since the last find or fix, or the model changed, `run --issue` stops before spending anything. Run it again with `--fresh` to run every task again first, which costs more.
+
+Both kinds of run stop early if the budget is spent; a fix whose try was already judged still prints its numbers, with `no verdict` since the experiment didn't finish. A failed run shows the judge's reason.

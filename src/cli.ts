@@ -8,8 +8,10 @@ import { ClaudeCode, finishLeftovers, killActiveRuns } from "./agent.js";
 import { callToolOn } from "./check.js";
 import { CONFIG_FILE, loadConfig, parseDsn, readDsn, renderConfig, saveDsn, credentialsPath } from "./config.js";
 import { ConsoleApi } from "./console.js";
-import { runExperiment } from "./runner.js";
-import { loadTasks, pickHeldOut, writeHeldOut } from "./tasks.js";
+import { isReusable, lastRunPath, planFix, readLastRun, reuseProblem, writeLastRun } from "./last.js";
+import { reportLines } from "./report.js";
+import { agentId, runExperiment } from "./runner.js";
+import { loadTasks, pickHeldOut, taskHashes, writeHeldOut } from "./tasks.js";
 
 const USAGE = `Usage:
   baton-eval init --server <slug> --tasks <file> --model <model> [--max-budget-usd <n>] [--force] [--replace-dsn] -- <command> [args...]
@@ -17,7 +19,10 @@ const USAGE = `Usage:
       ${credentialsPath()} (mode 600). The DSN is read from BATON_EVAL_DSN or stdin,
       never from the command line.
   baton-eval run [--config <file>]
-      Starts an experiment with the Console and runs the steps it hands out.`;
+      Finds issues: runs every task, then lists the issues the Console ranked.
+  baton-eval run --issue <id> [--fresh] [--config <file>]
+      Tests the issue's fix, reusing the last find's or fix's runs. --fresh runs the tasks again
+      first, which costs more, for when the last run can't be reused.`;
 
 function log(line: string): void {
   process.stderr.write(line + "\n");
@@ -77,7 +82,10 @@ async function init(argv: string[]): Promise<void> {
 }
 
 async function run(argv: string[]): Promise<void> {
-  const { values } = parseArgs({ args: argv, options: { config: { type: "string", default: CONFIG_FILE } } });
+  const { values } = parseArgs({
+    args: argv,
+    options: { config: { type: "string", default: CONFIG_FILE }, issue: { type: "string" }, fresh: { type: "boolean", default: false } },
+  });
   const config = loadConfig(values.config);
   const dsn = readDsn(config.server);
   const tasks = loadTasks(config.tasks, config.placeholders);
@@ -86,6 +94,9 @@ async function run(argv: string[]): Promise<void> {
     maxBudgetUsd: config.agent.maxBudgetUsd,
     binary: process.env.BATON_EVAL_CLAUDE || undefined,
   });
+  const lastFile = lastRunPath(values.config);
+  const now = { server: config.server, agent: agentId(agent), tasks: taskHashes(tasks) };
+  const fix = planFix(values.issue, values.fresh, readLastRun(lastFile), now);
   // The agent runs in its own process group, so Ctrl-C or a closed terminal would not reach it.
   for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]] as const) {
     process.once(signal, () => {
@@ -102,6 +113,7 @@ async function run(argv: string[]): Promise<void> {
     dsn: dsn.raw,
     callToolFor: callToolOn,
     budgetSessions: config.budgetSessions,
+    fix,
     onHeldOutPicked: (ids) => {
       const file = path.relative(".", config.tasks);
       try {
@@ -114,6 +126,24 @@ async function run(argv: string[]): Promise<void> {
     },
     log,
   }).finally(finishLeftovers);
+  const saveLastRun = () => {
+    try {
+      writeLastRun(lastFile, { experiment_id: summary.experimentId, ...now });
+    } catch (error) {
+      log(`baton-eval: couldn't save the last run to ${lastFile}: ${(error as Error).message}`);
+    }
+  };
+  const status = summary.status;
+  // A budget stop leaves the experiment running: only a fix's judged try has anything to report.
+  if (status && (!summary.stoppedFor || status.result != null)) {
+    for (const line of reportLines(summary.experimentId, status)) log(line);
+    if (!summary.stoppedFor && isReusable(status, fix?.from !== undefined)) saveLastRun();
+  } else if (summary.statusError) {
+    log(`baton-eval: reading the result failed: ${summary.statusError}`);
+    // A saved run that still works is the safer bet; without one, this find is the only baseline paid for.
+    if (!fix && !summary.stoppedFor && reuseProblem(readLastRun(lastFile), now) !== undefined) saveLastRun();
+    process.exitCode = 1;
+  }
   const { pass, fail, short } = summary.outcomes;
   log(`experiment ${summary.experimentId}: ${summary.steps} steps, ${pass} pass, ${fail} fail, ${short} short${summary.stoppedFor ? `; stopped: ${summary.stoppedFor}` : ""}`);
 }

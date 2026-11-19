@@ -19,6 +19,43 @@ interface Started {
   experiment_id: string;
   held_out: string[];
   budget_sessions: number;
+  url?: string | null;
+}
+
+export interface Issue {
+  issue: string;
+  tool: string;
+  error: string;
+  fix: string;
+  prod_sessions: number;
+  tasks: string[];
+  below_bar: boolean;
+  url?: string | null;
+}
+
+export interface FixResult {
+  targets: { before: [number, number]; after: [number, number] };
+  /** Runs that hit the issue's error; null when the calls couldn't be read in time. */
+  errors?: { before: [number, number]; after: [number, number] } | null;
+  guard: { held: boolean } | null;
+  held_out: { held: boolean } | null;
+}
+
+export interface Status {
+  kind: "find" | "fix";
+  state: string;
+  verdict: string | null;
+  reason: string | null;
+  issue?: string | null;
+  issues?: Issue[];
+  result?: FixResult | null;
+}
+
+interface StartBody {
+  tasks: TaskRef[];
+  task_set_hash: string;
+  agents: string[];
+  budget_sessions?: number | undefined;
 }
 
 export interface Step {
@@ -52,6 +89,7 @@ export interface RowOutcome {
   run: number;
   outcome: Outcome;
   reason?: string;
+  note?: string | null;
 }
 
 export class ConsoleError extends Error {
@@ -89,13 +127,21 @@ export class ConsoleApi {
     this.retryDelaysMs = options.retryDelaysMs ?? [1000, 4000, 15_000];
   }
 
-  /** Never retried: a retry after a lost answer would start a second experiment. */
-  async start(body: { tasks: TaskRef[]; task_set_hash: string; agents: string[]; budget_sessions?: number | undefined }): Promise<Started> {
-    const started = await this.call("POST", "/v0/experiments", body, false);
-    if (!isObject(started) || typeof started.experiment_id !== "string" || !isStringList(started.held_out) || typeof started.budget_sessions !== "number") {
-      throw new ConsoleError("bad_answer", `POST /v0/experiments: unexpected answer ${JSON.stringify(started)}`);
-    }
-    return started as unknown as Started;
+  /** A find without `issue`, else a fix with its own baseline. Never retried: a retry after a lost answer would start a second experiment. */
+  async start(body: StartBody & { issue?: string | undefined }): Promise<Started> {
+    return started("/v0/experiments", await this.call("POST", "/v0/experiments", body, false));
+  }
+
+  /** A fix on the baseline of a find that found, or of a fix made on one; added tasks get baseline runs. Never retried, as `start`. */
+  async fixFrom(find: string, body: StartBody & { issue: string }): Promise<Started> {
+    const path = `${this.experimentPath(find)}/fix`;
+    return started(path, await this.call("POST", path, body, false));
+  }
+
+  async status(experiment: string, server: string): Promise<Status> {
+    const body = await this.call("GET", `${this.experimentPath(experiment)}?server=${encodeURIComponent(server)}`);
+    if (!isStatus(body)) throw new ConsoleError("bad_answer", `status: unexpected answer ${JSON.stringify(body).slice(0, 300)}`);
+    return body;
   }
 
   async next(experiment: string): Promise<Next> {
@@ -180,6 +226,40 @@ export class ConsoleApi {
   }
 }
 
+function started(path: string, body: unknown): Started {
+  if (!isObject(body) || typeof body.experiment_id !== "string" || !isStringList(body.held_out) || typeof body.budget_sessions !== "number") {
+    throw new ConsoleError("bad_answer", `POST ${path}: unexpected answer ${JSON.stringify(body)}`);
+  }
+  return body as unknown as Started;
+}
+
+const isText = (value: unknown) => value === null || typeof value === "string";
+const isCount = (value: unknown): value is [number, number] => Array.isArray(value) && value.length === 2 && value.every(Number.isInteger);
+const isBeforeAfter = (value: unknown) => isObject(value) && isCount(value.before) && isCount(value.after);
+const isHeld = (value: unknown) => value === null || (isObject(value) && typeof value.held === "boolean");
+
+function isIssue(value: unknown): value is Issue {
+  return (
+    isObject(value) &&
+    typeof value.issue === "string" &&
+    typeof value.tool === "string" &&
+    typeof value.error === "string" &&
+    typeof value.fix === "string" &&
+    Number.isInteger(value.prod_sessions) &&
+    isStringList(value.tasks) &&
+    typeof value.below_bar === "boolean" &&
+    (value.url === undefined || isText(value.url))
+  );
+}
+
+function isStatus(value: unknown): value is Status {
+  if (!isObject(value) || (value.kind !== "find" && value.kind !== "fix") || typeof value.state !== "string" || !isText(value.verdict) || !isText(value.reason) || (value.issue !== undefined && !isText(value.issue))) return false;
+  if (value.issues !== undefined && !(Array.isArray(value.issues) && value.issues.every(isIssue))) return false;
+  const result = value.result;
+  if (result === undefined || result === null) return true;
+  return isObject(result) && isBeforeAfter(result.targets) && (result.errors == null || isBeforeAfter(result.errors)) && isHeld(result.guard) && isHeld(result.held_out);
+}
+
 /** Rows the runner scored itself go in one post: a not_loaded row ends the experiment (runner.test.ts: "marks every run of a step not_loaded"). */
 function chunks(rows: ResultRow[]): ResultRow[][] {
   const out: ResultRow[][] = [];
@@ -210,7 +290,8 @@ function isRowOutcome(value: unknown): value is RowOutcome {
     isObject(value) &&
     typeof value.task_id === "string" &&
     Number.isInteger(value.run) &&
-    (value.outcome === "pass" || value.outcome === "fail" || value.outcome === "short")
+    (value.outcome === "pass" || value.outcome === "fail" || value.outcome === "short") &&
+    (value.note === undefined || isText(value.note))
   );
 }
 

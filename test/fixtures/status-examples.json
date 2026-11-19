@@ -1,0 +1,216 @@
+{
+  "find_found": {
+    "experiment_id": "exp_pw43kzipgl",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_pw43kzipgl",
+    "kind": "find",
+    "state": "done",
+    "verdict": "found",
+    "reason": null,
+    "spent_sessions": 30,
+    "budget_sessions": 400,
+    "issues": [
+      {
+        "issue": "c1d549648c43f3fe.29a1af58c1382740",
+        "tool": "lookup",
+        "error": "Invalid field_paths: expected a list of strings, got a string",
+        "fix": "text",
+        "prod_sessions": 0,
+        "tasks": [
+          "b"
+        ],
+        "below_bar": false,
+        "proposed_fix": false,
+        "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite~test/issues/c1d549648c43f3fe.29a1af58c1382740"
+      }
+    ]
+  },
+  "fix_running_before_baseline": {
+    "experiment_id": "exp_iyfkmwuxe5",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_iyfkmwuxe5",
+    "kind": "fix",
+    "state": "running",
+    "verdict": null,
+    "reason": null,
+    "spent_sessions": 0,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": null
+  },
+  "fix_helped": {
+    "experiment_id": "exp_iyfkmwuxe5",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_iyfkmwuxe5",
+    "kind": "fix",
+    "state": "done",
+    "verdict": "helped",
+    "reason": null,
+    "spent_sessions": 88,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": {
+      "issue": "c1d549648c43f3fe.29a1af58c1382740",
+      "change_id": "chg_gmsqt5j2kt",
+      "targets": {
+        "tasks": [
+          "b"
+        ],
+        "before": [
+          0,
+          10
+        ],
+        "after": [
+          10,
+          10
+        ]
+      },
+      "guard": {
+        "held": true,
+        "difference": 0.0,
+        "margin": 0.1
+      },
+      "held_out": {
+        "held": true
+      }
+    }
+  },
+  "fix_no_better": {
+    "experiment_id": "exp_sd2urvms7y",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_sd2urvms7y",
+    "kind": "fix",
+    "state": "done",
+    "verdict": "no_better",
+    "reason": null,
+    "spent_sessions": 48,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": {
+      "issue": "c1d549648c43f3fe.29a1af58c1382740",
+      "change_id": "chg_y6irdjqfy3",
+      "targets": {
+        "tasks": [
+          "b"
+        ],
+        "before": [
+          0,
+          10
+        ],
+        "after": [
+          0,
+          10
+        ]
+      },
+      "guard": null,
+      "held_out": null
+    }
+  },
+  "fix_ended": {
+    "experiment_id": "exp_irjctmzmwd",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_irjctmzmwd",
+    "kind": "fix",
+    "state": "done",
+    "verdict": "ended",
+    "reason": "no_task_hits",
+    "spent_sessions": 30,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": null
+  },
+  "find_ended": {
+    "experiment_id": "exp_hdwfneiewz",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_hdwfneiewz",
+    "kind": "find",
+    "state": "done",
+    "verdict": "ended",
+    "reason": "find_failed",
+    "spent_sessions": 30,
+    "budget_sessions": 400
+  },
+  "helped_on_errors": {
+    "experiment_id": "exp_twvbbz54it",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_twvbbz54it",
+    "kind": "fix",
+    "state": "done",
+    "verdict": "helped",
+    "reason": null,
+    "spent_sessions": 88,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": {
+      "issue": "c1d549648c43f3fe.29a1af58c1382740",
+      "change_id": "chg_ddy7z3este",
+      "targets": {
+        "tasks": [
+          "b"
+        ],
+        "before": [
+          10,
+          10
+        ],
+        "after": [
+          10,
+          10
+        ]
+      },
+      "guard": {
+        "held": true,
+        "difference": 0.0,
+        "margin": 0.1
+      },
+      "held_out": {
+        "held": true
+      },
+      "errors": {
+        "after": [
+          0,
+          10
+        ],
+        "before": [
+          10,
+          10
+        ]
+      }
+    }
+  },
+  "waiting_for_calls": {
+    "experiment_id": "exp_tsvqczdd3d",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_tsvqczdd3d",
+    "kind": "fix",
+    "state": "running",
+    "verdict": null,
+    "reason": null,
+    "spent_sessions": 48,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": null
+  },
+  "errors_null_after_deadline": {
+    "experiment_id": "exp_tsvqczdd3d",
+    "url": "https://baton.goodtiming.ai/dashboard/super-carl-lite/super-carl-lite/autopilot/exp_tsvqczdd3d",
+    "kind": "fix",
+    "state": "done",
+    "verdict": "no_better",
+    "reason": null,
+    "spent_sessions": 48,
+    "budget_sessions": 400,
+    "issue": "c1d549648c43f3fe.29a1af58c1382740",
+    "result": {
+      "issue": "c1d549648c43f3fe.29a1af58c1382740",
+      "change_id": "chg_op5gvevdxi",
+      "targets": {
+        "tasks": [
+          "b"
+        ],
+        "before": [
+          10,
+          10
+        ],
+        "after": [
+          10,
+          10
+        ]
+      },
+      "guard": null,
+      "held_out": null,
+      "errors": null
+    }
+  }
+}

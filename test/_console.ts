@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { text } from "node:stream/consumers";
-import type { Outcome, ResultRow, TaskRef } from "../src/console.js";
+import type { Outcome, ResultRow, Status, TaskRef } from "../src/console.js";
 
 export interface FakeStep {
   change_id: string;
@@ -16,7 +16,9 @@ export interface FakeStep {
 export interface FakeConsole {
   origin: string;
   key: string;
-  started: { tasks: TaskRef[]; task_set_hash: string; agents?: string[] }[];
+  started: { tasks: TaskRef[]; task_set_hash: string; agents?: string[]; issue?: string }[];
+  /** Each /fix call: the find it reuses and its body. */
+  fixed: { find: string; body: { issue: string; task_set_hash: string; tasks: TaskRef[]; agents: string[] } }[];
   /** Each row as sent, with the outcome the Console stored for it. */
   results: { step: number; outcome: Outcome; reason?: string | undefined; sent: ResultRow }[];
   posts: number;
@@ -38,13 +40,19 @@ export async function fakeConsole(options: {
   noJudge?: boolean;
   /** Breaks the answer to a results post: one outcome missing, or one naming a run that wasn't sent. */
   badOutcomes?: "drop" | "misname";
+  status?: Status;
+  statusFails?: boolean;
+  fixRefusal?: string;
+  /** The judge's reason on each fail. */
+  note?: string;
 }): Promise<FakeConsole> {
   const key = "baton_tk_testkey0123456789";
-  const state: FakeConsole = { origin: "", key, started: [], results: [], posts: 0, loadedCalls: 0, close: async () => {} };
+  const state: FakeConsole = { origin: "", key, started: [], fixed: [], results: [], posts: 0, loadedCalls: 0, close: async () => {} };
   let stepIndex = 0;
   let waits = options.waitsBeforeFirstStep ?? 0;
   let judgeFailures = options.judgeFailures ?? 0;
   const budget = options.budgetSessions ?? 400;
+  const started = { experiment_id: "exp_1", held_out: options.heldOut ?? [], budget_sessions: budget, url: "https://console.test/autopilot/exp_1" };
 
   const server = http.createServer((req, res) => {
     void text(req).then((body) => {
@@ -59,7 +67,19 @@ export async function fakeConsole(options: {
         if (unstorable(JSON.parse(body))) return error(422, "unstorable_text");
         const parsed = JSON.parse(body) as FakeConsole["started"][number];
         state.started.push(parsed);
-        return send(201, { experiment_id: "exp_1", held_out: options.heldOut ?? [], budget_sessions: budget });
+        return send(201, started);
+      }
+      const fix = /^\/v0\/experiments\/(exp_\w+)\/fix$/.exec(url);
+      if (req.method === "POST" && fix) {
+        if (options.fixRefusal) return error(409, options.fixRefusal);
+        state.fixed.push({ find: fix[1]!, body: JSON.parse(body) as FakeConsole["fixed"][number]["body"] });
+        return send(201, started);
+      }
+      if (req.method === "GET" && url.startsWith("/v0/experiments/exp_1?")) {
+        // As the Console: a server that isn't the key's own has no experiments.
+        if (new URLSearchParams(url.split("?")[1]).get("server") !== "fixture") return error(404, "unknown_experiment");
+        if (options.statusFails) return error(500, "unavailable");
+        return send(200, { experiment_id: "exp_1", ...(options.status ?? { kind: "find", state: "done", verdict: null, reason: null, issues: [] }) });
       }
       if (req.method === "GET" && url === "/v0/experiments/exp_1/next") {
         if (options.nextAnswer !== undefined) return send(200, options.nextAnswer);
@@ -97,7 +117,7 @@ export async function fakeConsole(options: {
           if (state.results.length >= budget) return error(409, "budget_spent");
           const stored = row.outcome === undefined ? { outcome: judge(row) } : { outcome: row.outcome, reason: row.reason };
           state.results.push({ ...stored, step: Number(match[1]), sent: row });
-          outcomes.push({ task_id: row.task_id, run: row.run, ...stored });
+          outcomes.push({ task_id: row.task_id, run: row.run, ...stored, ...(stored.outcome === "fail" && options.note ? { note: options.note } : {}) });
         }
         if (state.results.filter((r) => r.step === Number(match[1])).length === step.task_ids.length * step.runs_per_task) {
           stepIndex += 1;

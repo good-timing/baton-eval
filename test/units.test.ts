@@ -8,7 +8,10 @@ import { parseOutput, type ProcessOutput } from "../src/agent.js";
 import { parsePath, runCheck, select } from "../src/check.js";
 import { loadConfig, parseDsn, readDsn, saveDsn } from "../src/config.js";
 import { launch } from "../src/server.js";
-import { loadTasks, pickHeldOut, taskSetHash, writeHeldOut } from "../src/tasks.js";
+import { ConsoleError, type Status } from "../src/console.js";
+import { isReusable, planFix, readLastRun, reuseProblem, withFreshHint, writeLastRun } from "../src/last.js";
+import { reportLines } from "../src/report.js";
+import { loadTasks, pickHeldOut, taskHashes, taskSetHash, writeHeldOut, type Task } from "../src/tasks.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 let dir: string;
@@ -258,5 +261,119 @@ describe("launch", () => {
     const server = { name: "s", command: "perl", args: ["-e", show], cwd: dir, env: {} };
     const { command, args, env } = launch(server, { shieldSignals: true });
     expect(spawnSync(command, args, { env, encoding: "utf8" }).stdout).toBe("default default");
+  });
+});
+
+describe("reportLines", () => {
+  it("reads the Console's real answers", () => {
+    const examples = JSON.parse(fs.readFileSync(path.join(fixtures, "status-examples.json"), "utf8")) as Record<string, Status & { experiment_id: string }>;
+    const lines = Object.fromEntries(Object.entries(examples).map(([name, status]) => [name, reportLines(status.experiment_id, status)]));
+    const token = "c1d549648c43f3fe.29a1af58c1382740";
+    expect(lines).toEqual({
+      find_found: [
+        "experiment exp_pw43kzipgl: found 1 issue",
+        `issue 1. ${token} text tool=lookup prod_sessions=0 tasks=b below_bar=no page=${examples.find_found!.issues![0]!.url}: Invalid field_paths: expected a list of strings, got a string`,
+      ],
+      fix_running_before_baseline: [`experiment exp_iyfkmwuxe5: fix ${token}: no verdict`],
+      fix_helped: [`experiment exp_iyfkmwuxe5: fix ${token}: helped; targets 0/10 -> 10/10; guard held; held-out held`],
+      fix_no_better: [`experiment exp_sd2urvms7y: fix ${token}: no_better; targets 0/10 -> 0/10; guard none; held-out none`],
+      fix_ended: [`experiment exp_irjctmzmwd: fix ${token}: ended (no_task_hits)`],
+      find_ended: ["experiment exp_hdwfneiewz: find ended (find_failed)"],
+      helped_on_errors: [`experiment exp_twvbbz54it: fix ${token}: helped; targets 10/10 -> 10/10; error 10/10 -> 0/10; guard held; held-out held`],
+      waiting_for_calls: [`experiment exp_tsvqczdd3d: fix ${token}: no verdict`],
+      errors_null_after_deadline: [`experiment exp_tsvqczdd3d: fix ${token}: no_better; targets 10/10 -> 10/10; guard none; held-out none`],
+    });
+  });
+
+  const issue = { issue: "a".repeat(16) + "." + "b".repeat(16), tool: "friction_on", error: "invalid day format\nat line 3", fix: "text", prod_sessions: 12, tasks: ["day", "day2"], below_bar: false, url: "https://c/i" };
+  const find = (extra: Partial<Status>): Status => ({ kind: "find", state: "done", verdict: "found", reason: null, ...extra });
+
+  it("lists a find's issues, one line each, the error last on one line", () => {
+    const quiet = { ...issue, issue: "c".repeat(16) + "." + "d".repeat(16), error: "timeout: 30s", fix: "code", prod_sessions: 0, tasks: [], below_bar: true, url: null };
+    expect(reportLines("exp_1", find({ issues: [issue, quiet] }))).toEqual([
+      "experiment exp_1: found 2 issues",
+      `issue 1. ${issue.issue} text tool=friction_on prod_sessions=12 tasks=day,day2 below_bar=no page=https://c/i: invalid day format`,
+      `issue 2. ${quiet.issue} code tool=friction_on prod_sessions=0 tasks=- below_bar=yes page=-: timeout: 30s`,
+    ]);
+    expect(reportLines("exp_1", find({ issues: [] }))).toEqual(["experiment exp_1: found no issues"]);
+    expect(reportLines("exp_1", find({ issues: [{ ...issue, error: "\u001e\n Traceback: bad day\nline 2" }] }))[1]).toMatch(/: Traceback: bad day$/);
+    const odd = { ...issue, tool: "my tool\u2028x", tasks: ["day one", "day2"], url: "https://c/a b" };
+    expect(reportLines("exp_1", find({ issues: [odd] }))[1]).toContain(" tool=my_tool prod_sessions=12 tasks=day_one,day2 below_bar=no page=https://c/a_b: ");
+    expect(reportLines("exp_1", find({ verdict: "ended", reason: "not_loaded" }))).toEqual(["experiment exp_1: find ended (not_loaded)"]);
+    expect(reportLines("exp_1", find({ verdict: null }))).toEqual(["experiment exp_1: find ended (done)"]);
+    expect(reportLines("exp_1", find({ verdict: "ended", reason: "budget\nissue 1. x" }))).toEqual(["experiment exp_1: find ended (budget)"]);
+  });
+
+  it("gives a fix's verdict, with its numbers once judged", () => {
+    const fix = (extra: Partial<Status>): Status => ({ kind: "fix", state: "done", verdict: "helped", reason: null, issue: issue.issue, ...extra });
+    const result: NonNullable<Status["result"]> = { targets: { before: [3, 10], after: [10, 10] }, guard: { held: true }, held_out: null };
+    expect(reportLines("exp_2", fix({ result }))).toEqual([`experiment exp_2: fix ${issue.issue}: helped; targets 3/10 -> 10/10; guard held; held-out none`]);
+    const worse = { ...result, guard: { held: false }, held_out: { held: false } };
+    expect(reportLines("exp_2", fix({ verdict: "worse", result: worse }))[0]).toMatch(/: worse; targets 3\/10 -> 10\/10; guard dropped; held-out didn't hold$/);
+    expect(reportLines("exp_2", fix({ verdict: "ended", reason: "no_task_hits", result: null }))).toEqual([`experiment exp_2: fix ${issue.issue}: ended (no_task_hits)`]);
+    const gone = { ...result, targets: { before: [20, 20] as [number, number], after: [20, 20] as [number, number] }, errors: { before: [13, 20] as [number, number], after: [0, 20] as [number, number] } };
+    expect(reportLines("exp_2", fix({ result: gone }))).toEqual([`experiment exp_2: fix ${issue.issue}: helped; targets 20/20 -> 20/20; error 13/20 -> 0/20; guard held; held-out none`]);
+    expect(reportLines("exp_2", fix({ result: { ...gone, errors: null } }))[0]).toContain("targets 20/20 -> 20/20; guard held");
+    expect(reportLines("exp_2", fix({ issue: "a b", verdict: "no better", reason: "x\ny", result: null }))).toEqual(["experiment exp_2: fix a_b: no_better (x)"]);
+  });
+});
+
+describe("the last run", () => {
+  const issue = "0".repeat(16) + "." + "f".repeat(16);
+  const t = (id: string, extra: Partial<Task> = {}): Task => ({ id, prompt: "p", check: { tool: "x", args: {} }, tools: ["x"], ...extra });
+  const now = (tasks: Task[]) => ({ server: "s", agent: "claude-code:m", tasks: taskHashes(tasks) });
+  const last = { experiment_id: "exp_0", ...now([t("a"), t("b")]) };
+
+  it("is reused when tasks were only added, or only held_out changed", () => {
+    expect(planFix(issue, false, last, now([t("a"), t("b", { held_out: true }), t("new")]))).toEqual({ issue, from: "exp_0" });
+    expect(planFix(undefined, false, last, now([t("a")]))).toBeUndefined();
+  });
+
+  it("isn't reused, and names --fresh, when a task changed or went, the agent or server changed, or there is none", () => {
+    const cases: [typeof last | undefined, ReturnType<typeof now>, string][] = [
+      [undefined, now([t("a")]), "no finished run"],
+      [last, now([t("a", { check: { tool: "x", args: { n: 1 } } }), t("b")]), "task a changed"],
+      [last, now([t("a", { tools: ["x", "y"] }), t("b")]), "task a changed"],
+      [last, now([t("a")]), "task b was removed"],
+      [last, { ...now([t("a"), t("b")]), agent: "claude-code:other" }, "now runs claude-code:other"],
+      [last, { ...now([t("a"), t("b")]), server: "s2" }, "for server s"],
+    ];
+    for (const [found, current, why] of cases) {
+      expect(reuseProblem(found, current)).toContain(why);
+      expect(() => planFix(issue, false, found, current)).toThrow(/--fresh/);
+      expect(planFix(issue, true, found, current)).toEqual({ issue });
+    }
+  });
+
+  it("refuses a bad issue id, and --fresh without --issue, before anything starts", () => {
+    expect(() => planFix("abc", false, last, now([t("a")]))).toThrow("--issue must be");
+    expect(() => planFix(undefined, true, last, now([t("a")]))).toThrow("--fresh goes with --issue");
+  });
+
+  it("adds --fresh to the Console's refusals of a reuse only", () => {
+    const refused = new ConsoleError("tasks_changed", "POST /v0/experiments/exp_0/fix: 409 tasks_changed");
+    expect(String(withFreshHint(refused))).toContain("pass --fresh");
+    const other = new ConsoleError("fix_on_trial", "POST /v0/experiments/exp_0/fix: 409 fix_on_trial");
+    expect(withFreshHint(other)).toBe(other);
+  });
+
+  it("is kept only after a find that found, or a judged fix made on reused runs", () => {
+    const examples = JSON.parse(fs.readFileSync(path.join(fixtures, "status-examples.json"), "utf8")) as Record<string, Status>;
+    const reusable = Object.entries(examples).filter(([, status]) => isReusable(status, true)).map(([name]) => name);
+    expect(reusable).toEqual(["find_found", "fix_helped", "fix_no_better", "helped_on_errors", "errors_null_after_deadline"]);
+    expect(isReusable(examples.fix_helped!, false)).toBe(false);
+  });
+
+  it("is kept in a file, and a broken file counts as none", () => {
+    const file = path.join(dir, ".baton-eval", "last.json");
+    writeLastRun(file, last);
+    expect(readLastRun(file)).toEqual(last);
+    fs.writeFileSync(file, "{");
+    expect(readLastRun(file)).toBeUndefined();
+  });
+
+  it("is ignored by git: its folder ignores itself", () => {
+    writeLastRun(path.join(dir, ".baton-eval", "last.json"), last);
+    expect(fs.readFileSync(path.join(dir, ".baton-eval", ".gitignore"), "utf8")).toBe("*\n");
   });
 });

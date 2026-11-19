@@ -113,10 +113,17 @@ function fillDeep(value: unknown, fill: (s: string) => string): unknown {
 
 /** Leaves out `held_out`, so writing the Console's pick back keeps the same hash and so the same pick (units.test.ts: "without changing the task set hash"). */
 export function taskSetHash(tasks: Task[]): string {
-  const canonical = [...tasks]
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map(({ id, prompt, check, tools }) => canonicalJson({ id, prompt, check, tools }));
+  const canonical = [...tasks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(canonicalTask);
   return "sha256:" + hash(canonical.join("\n"));
+}
+
+/** Each task's hash by id: what the Console's baseline ran, held_out aside. */
+export function taskHashes(tasks: Task[]): Record<string, string> {
+  return Object.fromEntries(tasks.map((task) => [task.id, hash(canonicalTask(task))]));
+}
+
+function canonicalTask({ id, prompt, check, tools }: Task): string {
+  return canonicalJson({ id, prompt, check, tools });
 }
 
 export function taskRefs(tasks: Task[]): TaskRef[] {

@@ -38,3 +38,14 @@ export function tryParseJson(text: string): unknown {
     return undefined;
   }
 }
+
+/** The first line of `text`, without control characters, so a printed field can't break a line a program reads. */
+export function oneLine(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.split(/[\n\r\u0085\u2028\u2029]/).map((line) => line.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim()).find((line) => line !== "") ?? "";
+}
+
+/** One word for a `key=value` field: spaces would shift the fields after it. */
+export function oneWord(text: string): string {
+  return oneLine(text).replace(/\s+/g, "_") || "-";
+}
