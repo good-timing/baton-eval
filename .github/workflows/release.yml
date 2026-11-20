@@ -1,0 +1,59 @@
+# npm Trusted Publishing (OIDC): the repo holds no npm token.
+# npmjs.com → baton-eval → Trusted Publisher: GitHub Actions, good-timing / baton-eval /
+# release.yml / environment npm. The environment name must match on both sides or OIDC is refused.
+# GitHub environment `npm` has a required reviewer, a 15-min wait and `v*` tags only,
+# so a run waits in `publish` until someone approves it.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  # npm would publish package.json's version under any tag name.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+  ci:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run ci
+
+  publish:
+    needs: [ci]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/baton-eval
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+      # Trusted publishing needs a newer npm than the runner's Node 22 bundles.
+      - run: npm install -g npm@latest
+      - run: npm ci
+      # `prepublishOnly` builds the dist/ that `files` ships; --ignore-scripts would publish it empty.
+      - run: npm publish
